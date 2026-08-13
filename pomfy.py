@@ -2,542 +2,955 @@
 Pomfy Stream Scraper
 ================================
 
-Protocol
---------
-Seguindo o protocolo do MegaSource, este arquivo define:
-
+Protocolo MegaSource:
     TITLE, VERSION, DESCRIPTION
-    get_streams(media_type: str, media_id: str, config: dict | None) -> list[dict]
+    get_streams(media_type, media_id, config=None) -> list[dict]
 
-media_type : "movie" | "series"
-media_id   : "tt0111161" (filme) | "tt0944947:1:1" (serie: temporada: episodio)
-
-Retorna streams com behaviorHints.proxyHeaders
-Usa apenas a biblioteca padrao do Python (urllib + cookiejar).
-
-Para usar: suba este arquivo como scraper.py num repositório do GitHub e
-adicione a URL raw no addon MegaSource (pagina de configuracao).
+Fluxo:
+  1) api.pomfy.stream/{filme|serie}/...  com Sec-Fetch-Dest: iframe
+  2) /api/play-token -> byseUrl
+  3) Resolve byse: challenge -> attest (ECDSA) -> PoW -> playback -> AES-GCM
 """
 
 import base64
+import hashlib
 import http.cookiejar
 import json
-import math
+import random
 import re
-import struct
+import ssl
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Optional
 
-# ============================================================
-# CONSTANTES
-# ============================================================
-
 TITLE = "Pomfy Scraper"
-VERSION = "1.0.0"
-DESCRIPTION = "Filmes e Series - Pomfy Stream"
+VERSION = "2.1.0"
+DESCRIPTION = "Filmes e Series - Pomfy Stream (iframe + byse full)"
 
 USER_AGENT = (
-    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/127.0.0.0 Mobile Safari/537.36"
+    "Mozilla/5.0 (Linux; Android 11; X96 Max+) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
 )
 
-TMDB_API_KEY = "\x33\x36\x34\x34\x64\x64\x34\x39\x35\x30\x62\x36\x37\x63\x64\x38\x30\x36\x37\x62\x38\x37\x37\x32\x64\x65\x35\x37\x36\x64\x36\x62"
-
-# Headers padrão
-DEFAULT_HEADERS = {
-    "User-Agent": USER_AGENT,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,webp,image/apng,*/*;q=0.8",
-    "Accept-Language": "pt-BR,pt;q=0.9",
-    "Referer": "https://pomfy.online/",
-    "Sec-Fetch-Dest": "iframe",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "cross-site",
-    "Upgrade-Insecure-Requests": "1",
-}
+TMDB_API_KEY = (
+    "\x33\x36\x34\x34\x64\x64\x34\x39\x35\x30\x62\x36\x37\x63\x64\x38"
+    "\x30\x36\x37\x62\x38\x37\x37\x32\x64\x65\x35\x37\x36\x64\x36\x62"
+)
 
 STREAM_HEADERS = {"Referer": "https://pomfy.online/"}
-
-# ============================================================
-# COOKIE JAR E OPENER
-# ============================================================
 
 _cookiejar = http.cookiejar.CookieJar()
 _opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_cookiejar))
 
 
-def _request(url: str, method: str = "GET", data=None, headers=None):
-    """Função auxiliar para fazer requisições HTTP"""
-    request_headers = {"User-Agent": USER_AGENT}
+def _request(url, method="GET", data=None, headers=None, timeout=30):
+    h = {"User-Agent": USER_AGENT, "Accept-Language": "pt-BR,pt;q=0.9"}
     if headers:
-        request_headers.update(headers)
-
+        h.update(headers)
     body = None
-    if method == "POST":
+    if method == "POST" and data is not None:
         if isinstance(data, dict):
-            body = json.dumps(data).encode("utf-8")
-            request_headers["Content-Type"] = "application/json"
-        elif data is not None:
+            body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            h.setdefault("Content-Type", "application/json")
+        else:
             body = data
-
-    req = urllib.request.Request(url, data=body, headers=request_headers, method=method)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    req = urllib.request.Request(url, data=body, headers=h, method=method)
     try:
-        with _opener.open(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
             return resp.status, resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        return exc.code, exc.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        try:
+            b = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            b = ""
+        return e.code, b
     except Exception:
         return 0, ""
 
 
-# ============================================================
-# BASE64 - DECODIFICAR E CODIFICAR
-# ============================================================
-
-def base64_decode(base64_string: str) -> bytes:
-    """Decodifica Base64 URL-safe para bytes"""
-    # Converte URL-safe para base64 padrão
-    decoded = base64_string.replace("-", "+").replace("_", "/")
-
-    # Adiciona padding se necessário
-    while len(decoded) % 4 != 0:
-        decoded += "="
-
-    return base64.b64decode(decoded)
+def b64url_encode(data: bytes) -> str:
+    return base64.b64encode(data).decode().replace("+", "-").replace("/", "_").rstrip("=")
 
 
-def base64_encode(data: bytes) -> str:
-    """Codifica bytes para Base64 URL-safe"""
-    return base64.b64encode(data).decode("utf-8").replace("+", "-").replace("/", "_").rstrip("=")
+def b64url_decode(s: str) -> bytes:
+    s = s.replace("-", "+").replace("_", "/")
+    while len(s) % 4:
+        s += "="
+    return base64.b64decode(s)
+
+
+def random_bytes(n: int) -> bytes:
+    return random.getrandbits(n * 8).to_bytes(n, "big")
 
 
 # ============================================================
-# CONVERSÃO UTF-8
+# AES-256-GCM (compatível com byse / aesgcm.py)
 # ============================================================
 
-def utf8_bytes_to_string(bytes_data: bytes) -> str:
-    """Converte bytes UTF-8 para string"""
-    try:
-        return bytes_data.decode("utf-8")
-    except UnicodeDecodeError:
-        # Fallback para caracteres inválidos
-        return bytes_data.decode("utf-8", errors="replace")
-
-
-def string_to_utf8_bytes(text: str) -> bytes:
-    """Converte string para bytes UTF-8"""
-    return text.encode("utf-8")
-
-
-# ============================================================
-# AES-256 (Rijndael) - IMPLEMENTAÇÃO
-# ============================================================
-
-# S-Box do AES
 SBOX = [
-    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5,
-    0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
-    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0,
-    0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
-    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc,
-    0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
-    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a,
-    0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
-    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0,
-    0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
-    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b,
-    0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
-    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85,
-    0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
-    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5,
-    0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
-    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17,
-    0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
-    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88,
-    0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
-    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c,
-    0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
-    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9,
-    0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
-    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6,
-    0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
-    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e,
-    0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
-    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94,
-    0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
-    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68,
-    0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
 ]
-
 RCON = [0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36]
 
 
 class AESCipher:
-    """Implementação AES-256 em modo CTR"""
+    def __init__(self, key):
+        if len(key) != 32:
+            raise ValueError("AES-256 key must be 32 bytes")
+        self.rk = self._expand_key(key)
 
-    def __init__(self, key_bytes: bytes):
-        self.round_keys = self._expand_key(key_bytes)
-
-    def _expand_key(self, key: bytes) -> list:
-        """Expande a chave de 32 bytes para 60 palavras (240 bytes)"""
-        round_keys = [0] * 60
-
-        # Copia a chave inicial
+    def _expand_key(self, key):
+        rk = [0] * 60
         for i in range(8):
-            round_keys[i] = struct.unpack(">I", key[i * 4:(i + 1) * 4])[0]
-
+            rk[i] = int.from_bytes(key[i * 4:(i + 1) * 4], "big")
         for i in range(8, 60):
-            temp = round_keys[i - 1]
-
+            t = rk[i - 1]
             if i % 8 == 0:
-                # RotWord
-                temp = ((temp << 8) | (temp >> 24)) & 0xFFFFFFFF
-                # SubWord
-                temp = (
-                    (SBOX[temp >> 24] << 24) |
-                    (SBOX[(temp >> 16) & 0xFF] << 16) |
-                    (SBOX[(temp >> 8) & 0xFF] << 8) |
-                    SBOX[temp & 0xFF]
-                )
-                # XOR com RCON
-                temp ^= RCON[i // 8] << 24
+                t = ((t << 8) | (t >> 24)) & 0xFFFFFFFF
+                t = ((SBOX[t >> 24] << 24) | (SBOX[(t >> 16) & 0xFF] << 16) |
+                     (SBOX[(t >> 8) & 0xFF] << 8) | SBOX[t & 0xFF])
+                t ^= RCON[i // 8] << 24
             elif i % 8 == 4:
-                # SubWord
-                temp = (
-                    (SBOX[temp >> 24] << 24) |
-                    (SBOX[(temp >> 16) & 0xFF] << 16) |
-                    (SBOX[(temp >> 8) & 0xFF] << 8) |
-                    SBOX[temp & 0xFF]
-                )
+                t = ((SBOX[t >> 24] << 24) | (SBOX[(t >> 16) & 0xFF] << 16) |
+                     (SBOX[(t >> 8) & 0xFF] << 8) | SBOX[t & 0xFF])
+            rk[i] = (rk[i - 8] ^ t) & 0xFFFFFFFF
+        return rk
 
-            round_keys[i] = (round_keys[i - 8] ^ temp) & 0xFFFFFFFF
+    @staticmethod
+    def _xtime(a):
+        return ((a << 1) ^ 0x1B) & 0xFF if (a & 0x80) else (a << 1) & 0xFF
 
-        return round_keys
+    def encrypt_block(self, block):
+        state = [[0] * 4 for _ in range(4)]
+        for c in range(4):
+            for r in range(4):
+                state[r][c] = block[c * 4 + r]
 
-    def _galois_multiply(self, a: int, b: int) -> int:
-        """Multiplicação no campo de Galois GF(2^8)"""
-        result = 0
+        def add_round_key(rnd):
+            for c in range(4):
+                k = self.rk[rnd * 4 + c]
+                state[0][c] ^= (k >> 24) & 0xFF
+                state[1][c] ^= (k >> 16) & 0xFF
+                state[2][c] ^= (k >> 8) & 0xFF
+                state[3][c] ^= k & 0xFF
 
-        for _ in range(8):
-            if b & 1:
-                result ^= a
+        def sub_bytes():
+            for r in range(4):
+                for c in range(4):
+                    state[r][c] = SBOX[state[r][c]]
 
-            carry = a & 0x80
-            a = (a << 1) & 0xFF
-
-            if carry:
-                a ^= 0x1B
-
-            b >>= 1
-
-        return result
-
-    def _encrypt_block(self, block: bytes) -> bytes:
-        """Criptografa um bloco de 16 bytes"""
-        # Converte para matriz state (linhas x colunas)
-        state = [
-            [block[0], block[4], block[8], block[12]],
-            [block[1], block[5], block[9], block[13]],
-            [block[2], block[6], block[10], block[14]],
-            [block[3], block[7], block[11], block[15]]
-        ]
-
-        def add_round_key(state, round_num):
-            for col in range(4):
-                round_key = self.round_keys[round_num * 4 + col]
-                for row in range(4):
-                    state[row][col] ^= (round_key >> (24 - 8 * row)) & 0xFF
-
-        # Round 0 - AddRoundKey
-        add_round_key(state, 0)
-
-        # Rounds 1 a 13
-        for round_num in range(1, 14):
-            # SubBytes
-            for row in range(4):
-                for col in range(4):
-                    state[row][col] = SBOX[state[row][col]]
-
-            # ShiftRows
+        def shift_rows():
             state[1] = [state[1][1], state[1][2], state[1][3], state[1][0]]
             state[2] = [state[2][2], state[2][3], state[2][0], state[2][1]]
             state[3] = [state[3][3], state[3][0], state[3][1], state[3][2]]
 
-            # MixColumns
-            for col in range(4):
-                a = state[0][col]
-                b = state[1][col]
-                c = state[2][col]
-                d = state[3][col]
+        def mix_columns():
+            for c in range(4):
+                a, b, d, e = state[0][c], state[1][c], state[2][c], state[3][c]
+                state[0][c] = self._xtime(a) ^ self._xtime(b) ^ b ^ d ^ e
+                state[1][c] = a ^ self._xtime(b) ^ self._xtime(d) ^ d ^ e
+                state[2][c] = a ^ b ^ self._xtime(d) ^ self._xtime(e) ^ e
+                state[3][c] = self._xtime(a) ^ a ^ b ^ d ^ self._xtime(e)
 
-                state[0][col] = (
-                    self._galois_multiply(2, a) ^
-                    self._galois_multiply(3, b) ^
-                    c ^ d
-                )
-                state[1][col] = (
-                    a ^
-                    self._galois_multiply(2, b) ^
-                    self._galois_multiply(3, c) ^
-                    d
-                )
-                state[2][col] = (
-                    a ^
-                    b ^
-                    self._galois_multiply(2, c) ^
-                    self._galois_multiply(3, d)
-                )
-                state[3][col] = (
-                    self._galois_multiply(3, a) ^
-                    b ^
-                    c ^
-                    self._galois_multiply(2, d)
-                )
-
-            # AddRoundKey
-            add_round_key(state, round_num)
-
-        # Round 14 (final - sem MixColumns)
-        for row in range(4):
-            for col in range(4):
-                state[row][col] = SBOX[state[row][col]]
-
-        state[1] = [state[1][1], state[1][2], state[1][3], state[1][0]]
-        state[2] = [state[2][2], state[2][3], state[2][0], state[2][1]]
-        state[3] = [state[3][3], state[3][0], state[3][1], state[3][2]]
-
-        add_round_key(state, 14)
-
-        # Converte de volta para bytes
-        result = bytearray(16)
-        for col in range(4):
-            for row in range(4):
-                result[col * 4 + row] = state[row][col]
-
-        return bytes(result)
-
-    def decrypt(self, iv: bytes, ciphertext: bytes) -> str:
-        """Descriptografa usando modo CTR"""
-        # CTR mode - contador começa com IV + nonce
-        counter = bytearray(16)
-        counter[:len(iv)] = iv
-        counter[15] = 2  # Nonce fixo
-
-        plaintext = bytearray(len(ciphertext))
-
-        for i in range(0, len(ciphertext), 16):
-            # Gera keystream
-            keystream = self._encrypt_block(bytes(counter))
-
-            # XOR com o ciphertext
-            block_size = min(16, len(ciphertext) - i)
-            for j in range(block_size):
-                plaintext[i + j] = ciphertext[i + j] ^ keystream[j]
-
-            # Incrementa o contador (apenas os últimos 4 bytes)
-            for k in range(15, 11, -1):
-                counter[k] += 1
-                if counter[k] != 0:
-                    break
-
-        return utf8_bytes_to_string(bytes(plaintext))
+        add_round_key(0)
+        for r in range(1, 14):
+            sub_bytes(); shift_rows(); mix_columns(); add_round_key(r)
+        sub_bytes(); shift_rows(); add_round_key(14)
+        out = bytearray(16)
+        for c in range(4):
+            for r in range(4):
+                out[c * 4 + r] = state[r][c]
+        return bytes(out)
 
 
-# ============================================================
-# SELEÇÃO DE PARTES DA CHAVE
-# ============================================================
-
-def _get_key_mapping() -> dict:
-    """Gera o mapeamento de versão para índices"""
-    mapping = {}
-    for i in range(1, 31):
-        a = i ^ 0
-        b = 31 - i ^ 0
-        mapping[str(i)] = [a, b]
-    return mapping
+_GCM_REDUCTION_TABLE = [
+    0x0000, 0x1c20, 0x3840, 0x2460, 0x7080, 0x6ca0, 0x48c0, 0x54e0,
+    0xe100, 0xfd20, 0xd940, 0xc560, 0x9180, 0x8da0, 0xa9c0, 0xb5e0,
+]
 
 
-def _get_indices(version: int, total_parts: int) -> list:
-    """Obtém os índices baseado na versão"""
-    mapping = _get_key_mapping()
-    indices = mapping.get(str(version), [])
-
-    if not indices or not isinstance(indices, list):
-        return []
-
-    result = []
-    for idx in indices:
-        if 1 <= idx <= total_parts:
-            result.append(idx - 1)
-
-    return result
+def _reverse_bits(i):
+    i = ((i << 2) & 0xc) | ((i >> 2) & 0x3)
+    i = ((i << 1) & 0xa) | ((i >> 1) & 0x5)
+    return i
 
 
-def _select_key_parts(data: dict) -> list:
-    """Seleciona as partes da chave baseado na versão"""
-    key_parts = data.get("key_parts", [])
-    if not isinstance(key_parts, list):
-        key_parts = []
-
-    indices = _get_indices(data.get("version", 0), len(key_parts))
-
-    if not indices:
-        return key_parts[:2]
-
-    selected = []
-    for idx in indices:
-        part = key_parts[idx] if idx < len(key_parts) else None
-        if part and len(part) > 0:
-            selected.append(part)
-
-    return selected if selected else key_parts[:2]
+def _gcm_shift(x):
+    high = x & 1
+    x >>= 1
+    if high:
+        x ^= 0xe1 << (128 - 8)
+    return x
 
 
-def _build_key(data: dict) -> bytes:
-    """Constrói a chave de 32 bytes a partir das partes"""
-    selected_parts = _select_key_parts(data)
-    decoded_parts = [base64_decode(part) for part in selected_parts]
+def _build_product_table(h):
+    table = [0] * 16
+    table[_reverse_bits(1)] = h
+    for i in range(2, 16, 2):
+        table[_reverse_bits(i)] = _gcm_shift(table[_reverse_bits(i // 2)])
+        table[_reverse_bits(i + 1)] = table[_reverse_bits(i)] ^ h
+    return table
 
-    combined = b"".join(decoded_parts)
 
-    # A chave deve ter 32 bytes (256 bits)
-    if len(combined) > 32:
-        return combined[:32]
+def _gcm_mul(y, product_table):
+    ret = 0
+    for _ in range(0, 128, 4):
+        ret_high = ret & 0xf
+        ret >>= 4
+        ret ^= (_GCM_REDUCTION_TABLE[ret_high] << (128 - 16))
+        ret ^= product_table[y & 0xf]
+        y >>= 4
+    return ret
 
-    return combined
+
+def _bytes_to_number(b):
+    return int.from_bytes(b, "big")
+
+
+def _number_to_bytes(n, length=16):
+    return n.to_bytes(length, "big")
+
+
+def _gcm_update(y, data, product_table):
+    for i in range(0, len(data) // 16):
+        y ^= _bytes_to_number(data[16 * i:16 * i + 16])
+        y = _gcm_mul(y, product_table)
+    extra = len(data) % 16
+    if extra:
+        block = bytearray(16)
+        block[:extra] = data[-extra:]
+        y ^= _bytes_to_number(block)
+        y = _gcm_mul(y, product_table)
+    return y
+
+
+def aes_gcm_decrypt(key, iv, ciphertext, tag, aad=b""):
+    """AES-256-GCM (byse/aesgcm.py style). Does not fail on tag (empty AAD path)."""
+    if len(key) != 32:
+        raise ValueError("key 32 bytes")
+    if len(iv) != 12:
+        raise ValueError("iv 12 bytes")
+    cipher = AESCipher(key)
+    h = _bytes_to_number(cipher.encrypt_block(b"\x00" * 16))
+    product_table = _build_product_table(h)
+    counter = bytearray(16)
+    counter[:12] = iv
+    counter[15] = 1
+    # tag_mask unused when skipping verify
+    counter[15] = 2
+    plaintext = bytearray()
+    for i in range(0, len(ciphertext), 16):
+        keystream = cipher.encrypt_block(bytes(counter))
+        block = ciphertext[i:i + 16]
+        for k in range(len(block)):
+            plaintext.append(keystream[k] ^ block[k])
+        for j in range(15, 11, -1):
+            counter[j] = (counter[j] + 1) & 0xFF
+            if counter[j] != 0:
+                break
+    return bytes(plaintext)
 
 
 # ============================================================
-# DECODIFICAÇÃO DO PLAYBACK
+# Fingerprint + ECDSA + PoW
 # ============================================================
 
-def decode_playback(playback_data: dict) -> dict:
-    """Decodifica os dados do playback para obter a URL"""
-    try:
-        key = _build_key(playback_data)
-        iv = base64_decode(playback_data.get("iv", ""))
-        payload = base64_decode(playback_data.get("payload", ""))
+_ANDROID_PROFILES = [
+    {
+        "user_agent": "Mozilla/5.0 (Linux; Android 11; X96 Max+) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36",
+        "model": "X96 Max+",
+        "platform_version": "11.0.0",
+        "hardware_concurrency": 4,
+        "device_memory": 2,
+        "pixel_ratio": 1,
+        "screen_width": 1280,
+        "screen_height": 720,
+        "webgl_vendor": "Google Inc. (ARM)",
+        "webgl_renderer": "ANGLE (ARM, Mali-G31 MP2, OpenGL ES 3.2)",
+        "touch_points": 1,
+        "pointer_type": "coarse",
+    },
+    {
+        "user_agent": "Mozilla/5.0 (Linux; Android 11; SM-A037F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36",
+        "model": "SM-A037F",
+        "platform_version": "11.0.0",
+        "hardware_concurrency": 4,
+        "device_memory": 2,
+        "pixel_ratio": 1.5,
+        "screen_width": 720,
+        "screen_height": 1600,
+        "webgl_vendor": "Google Inc. (ARM)",
+        "webgl_renderer": "ANGLE (ARM, Mali-G57 MP1, OpenGL ES 3.2)",
+        "touch_points": 5,
+        "pointer_type": "coarse,hover,touch",
+    },
+    {
+        "user_agent": "Mozilla/5.0 (Linux; Android 10; TX6s) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36",
+        "model": "TX6s",
+        "platform_version": "10.0.0",
+        "hardware_concurrency": 4,
+        "device_memory": 2,
+        "pixel_ratio": 1,
+        "screen_width": 1280,
+        "screen_height": 720,
+        "webgl_vendor": "Google Inc. (ARM)",
+        "webgl_renderer": "ANGLE (ARM, Mali-G31 MP2, OpenGL ES 3.2)",
+        "touch_points": 1,
+        "pointer_type": "coarse",
+    },
+    {
+        "user_agent": "Mozilla/5.0 (Linux; Android 10; Redmi 9A) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36",
+        "model": "Redmi 9A",
+        "platform_version": "10.0.0",
+        "hardware_concurrency": 4,
+        "device_memory": 2,
+        "pixel_ratio": 1.5,
+        "screen_width": 720,
+        "screen_height": 1600,
+        "webgl_vendor": "Google Inc. (ARM)",
+        "webgl_renderer": "ANGLE (ARM, Mali-G52 MC2, OpenGL ES 3.2)",
+        "touch_points": 5,
+        "pointer_type": "coarse,hover,touch",
+    },
+]
 
-        # Remove o último bloco (16 bytes) que é o HMAC/tag
-        ciphertext = payload[:-16]
-
-        cipher = AESCipher(key)
-        decrypted_text = cipher.decrypt(iv, ciphertext)
-
-        json_data = json.loads(decrypted_text)
-
-        # Extrai a URL
-        url = (
-            json_data.get("url") or
-            (json_data.get("sources") and json_data["sources"][0].get("url")) or
-            (json_data.get("data") and json_data["data"].get("sources") and
-             json_data["data"]["sources"][0].get("url"))
-        )
-
-        if url:
-            return {
-                "success": True,
-                "url": url.replace("\\u0026", "&")
-            }
-
-        return {"success": False, "error": "URL não encontrada"}
-
-    except Exception as error:
-        return {"success": False, "error": str(error)}
-
-
-# ============================================================
-# GERAÇÃO DE FINGERPRINT
-# ============================================================
-
-def _random_hex_string(length: int) -> str:
-    """Gera uma string hexadecimal aleatória"""
-    import random
-    chars = "abcdef0123456789"
-    return "".join(random.choice(chars) for _ in range(length))
-
-
-def generate_fingerprint() -> dict:
-    """Gera o fingerprint para autenticação"""
-    viewer_id = _random_hex_string(32)
-    device_id = _random_hex_string(32)
-    timestamp = int(time.time())
-
-    payload = {
-        "viewer_id": viewer_id,
-        "device_id": device_id,
-        "confidence": 0.93,
-        "iat": timestamp,
-        "exp": timestamp + 600  # 10 minutos
-    }
-
-    json_string = json.dumps(payload)
-    utf8_bytes = string_to_utf8_bytes(json_string)
-    token = base64_encode(utf8_bytes)
-
+def generate_fingerprint():
+    p = random.choice(_ANDROID_PROFILES)
+    ua = p["user_agent"]
+    r = random.random()
     return {
-        "token": token,
+        "user_agent": ua,
+        "architecture": "arm64-v8a",
+        "bitness": "64",
+        "platform": "Android",
+        "platform_version": p["platform_version"],
+        "model": p["model"],
+        "ua_full_version": "137.0.7337.0",
+        "brand_full_versions": [{"brand": "Chromium", "version": "137.0.7337.0"}, {"brand": "Not/A)Brand", "version": "24.0.0.0"}],
+        "pixel_ratio": p["pixel_ratio"],
+        "screen_width": p["screen_width"],
+        "screen_height": p["screen_height"],
+        "color_depth": 24,
+        "languages": ["pt-BR"],
+        "timezone": "America/Recife",
+        "hardware_concurrency": p["hardware_concurrency"],
+        "device_memory": p["device_memory"],
+        "touch_points": p["touch_points"],
+        "webgl_vendor": p["webgl_vendor"],
+        "webgl_renderer": p["webgl_renderer"],
+        "canvas_hash": b64url_encode(hashlib.sha256(str(r).encode()).digest()),
+        "audio_hash": b64url_encode(hashlib.sha256(str(r + 1).encode()).digest()),
+        "webgl_params_hash": b64url_encode(hashlib.sha256(str(r + 2).encode()).digest()),
+        "fonts_hash": b64url_encode(hashlib.sha256(str(r + 3).encode()).digest()),
+        "codecs_hash": b64url_encode(hashlib.sha256(str(r + 4).encode()).digest()),
+        "media_devices": "ai1ao1vi4",
+        "pointer_type": p["pointer_type"],
+        "extra": {"vendor": "Google Inc.", "appVersion": ua[len("Mozilla/"):]}
+    }
+
+def make_attestation(challenge, client, viewer_id, device_id):
+    challenge_id = challenge.get("challenge_id")
+    nonce = challenge.get("nonce", "")
+    priv, pub_x, pub_y = ECDSA_P256.generate_keypair()
+    sig_bytes = ECDSA_P256.sign(priv, str(nonce).encode())
+    sig = b64url_encode(sig_bytes)
+    x = b64url_encode(pub_x.to_bytes(32, 'big'))
+    y = b64url_encode(pub_y.to_bytes(32, 'big'))
+    return {
         "viewer_id": viewer_id,
         "device_id": device_id,
-        "confidence": 0.93
+        "challenge_id": challenge_id,
+        "nonce": nonce,
+        "signature": sig,
+        "public_key": {"crv": "P-256", "ext": True, "key_ops": ["verify"], "kty": "EC", "x": x, "y": y},
+        "client": client,
+        "storage": {"cookie": viewer_id, "local_storage": viewer_id, "indexed_db": f"{viewer_id}:{device_id}", "cache_storage": f"{viewer_id}:{device_id}"},
+        "attributes": {"entropy": "very_high"}
     }
 
 
+class ECDSA_P256:
+    p = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF
+    a = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFC
+    b = 0x5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B
+    n = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+    Gx = 0x6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296
+    Gy = 0x4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5
+
+    @staticmethod
+    def _mod_inv(a, m):
+        m0, x0, x1 = m, 0, 1
+        while a > 1:
+            q = a // m
+            a, m = m, a % m
+            x0, x1 = x1 - q * x0, x0
+        return x1 % m0
+
+    @classmethod
+    def _point_add(cls, P, Q):
+        if P is None: return Q
+        if Q is None: return P
+        x1, y1 = P
+        x2, y2 = Q
+        if x1 == x2 and y1 == y2:
+            return cls._point_double(P)
+        if x1 == x2:
+            return None
+        s = ((y2 - y1) * cls._mod_inv((x2 - x1) % cls.p, cls.p)) % cls.p
+        x3 = (s * s - x1 - x2) % cls.p
+        y3 = (s * (x1 - x3) - y1) % cls.p
+        return (x3, y3)
+
+    @classmethod
+    def _point_double(cls, P):
+        if P is None: return None
+        x1, y1 = P
+        if y1 == 0: return None
+        s = ((3 * x1 * x1 + cls.a) * cls._mod_inv((2 * y1) % cls.p, cls.p)) % cls.p
+        x3 = (s * s - 2 * x1) % cls.p
+        y3 = (s * (x1 - x3) - y1) % cls.p
+        return (x3, y3)
+
+    @classmethod
+    def _scalar_mult(cls, k, P):
+        if k == 0 or P is None: return None
+        result = None
+        addend = P
+        while k:
+            if k & 1:
+                result = cls._point_add(result, addend)
+            addend = cls._point_double(addend)
+            k >>= 1
+        return result
+
+    @classmethod
+    def generate_keypair(cls):
+        priv = random.randint(1, cls.n - 1)
+        pub = cls._scalar_mult(priv, (cls.Gx, cls.Gy))
+        return priv, pub[0], pub[1]
+
+    @classmethod
+    def sign(cls, priv, message):
+        hash_int = int.from_bytes(hashlib.sha256(message).digest(), 'big')
+        k = random.randint(1, cls.n - 1)
+        kG = cls._scalar_mult(k, (cls.Gx, cls.Gy))
+        if kG is None:
+            raise RuntimeError("Erro ao gerar ponto kG")
+        r = kG[0] % cls.n
+        if r == 0:
+            return cls.sign(priv, message)
+        k_inv = cls._mod_inv(k, cls.n)
+        s = (k_inv * (hash_int + priv * r)) % cls.n
+        if s == 0:
+            return cls.sign(priv, message)
+        return r.to_bytes(32, 'big') + s.to_bytes(32, 'big')
+
 # ============================================================
-# BUSCA NO TMDB
+# FINGERPRINT
+# ============================================================
+
+_ANDROID_PROFILES = [
+    {
+        "user_agent": "Mozilla/5.0 (Linux; Android 11; X96 Max+) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36",
+        "model": "X96 Max+",
+        "platform_version": "11.0.0",
+        "hardware_concurrency": 4,
+        "device_memory": 2,
+        "pixel_ratio": 1,
+        "screen_width": 1280,
+        "screen_height": 720,
+        "webgl_vendor": "Google Inc. (ARM)",
+        "webgl_renderer": "ANGLE (ARM, Mali-G31 MP2, OpenGL ES 3.2)",
+        "touch_points": 1,
+        "pointer_type": "coarse",
+    },
+    {
+        "user_agent": "Mozilla/5.0 (Linux; Android 11; SM-A037F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36",
+        "model": "SM-A037F",
+        "platform_version": "11.0.0",
+        "hardware_concurrency": 4,
+        "device_memory": 2,
+        "pixel_ratio": 1.5,
+        "screen_width": 720,
+        "screen_height": 1600,
+        "webgl_vendor": "Google Inc. (ARM)",
+        "webgl_renderer": "ANGLE (ARM, Mali-G57 MP1, OpenGL ES 3.2)",
+        "touch_points": 5,
+        "pointer_type": "coarse,hover,touch",
+    },
+    {
+        "user_agent": "Mozilla/5.0 (Linux; Android 10; TX6s) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36",
+        "model": "TX6s",
+        "platform_version": "10.0.0",
+        "hardware_concurrency": 4,
+        "device_memory": 2,
+        "pixel_ratio": 1,
+        "screen_width": 1280,
+        "screen_height": 720,
+        "webgl_vendor": "Google Inc. (ARM)",
+        "webgl_renderer": "ANGLE (ARM, Mali-G31 MP2, OpenGL ES 3.2)",
+        "touch_points": 1,
+        "pointer_type": "coarse",
+    },
+    {
+        "user_agent": "Mozilla/5.0 (Linux; Android 10; Redmi 9A) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36",
+        "model": "Redmi 9A",
+        "platform_version": "10.0.0",
+        "hardware_concurrency": 4,
+        "device_memory": 2,
+        "pixel_ratio": 1.5,
+        "screen_width": 720,
+        "screen_height": 1600,
+        "webgl_vendor": "Google Inc. (ARM)",
+        "webgl_renderer": "ANGLE (ARM, Mali-G52 MC2, OpenGL ES 3.2)",
+        "touch_points": 5,
+        "pointer_type": "coarse,hover,touch",
+    },
+]
+
+def generate_fingerprint():
+    p = random.choice(_ANDROID_PROFILES)
+    ua = p["user_agent"]
+    r = random.random()
+    return {
+        "user_agent": ua,
+        "architecture": "arm64-v8a",
+        "bitness": "64",
+        "platform": "Android",
+        "platform_version": p["platform_version"],
+        "model": p["model"],
+        "ua_full_version": "137.0.7337.0",
+        "brand_full_versions": [{"brand": "Chromium", "version": "137.0.7337.0"}, {"brand": "Not/A)Brand", "version": "24.0.0.0"}],
+        "pixel_ratio": p["pixel_ratio"],
+        "screen_width": p["screen_width"],
+        "screen_height": p["screen_height"],
+        "color_depth": 24,
+        "languages": ["pt-BR"],
+        "timezone": "America/Recife",
+        "hardware_concurrency": p["hardware_concurrency"],
+        "device_memory": p["device_memory"],
+        "touch_points": p["touch_points"],
+        "webgl_vendor": p["webgl_vendor"],
+        "webgl_renderer": p["webgl_renderer"],
+        "canvas_hash": b64url_encode(hashlib.sha256(str(r).encode()).digest()),
+        "audio_hash": b64url_encode(hashlib.sha256(str(r + 1).encode()).digest()),
+        "webgl_params_hash": b64url_encode(hashlib.sha256(str(r + 2).encode()).digest()),
+        "fonts_hash": b64url_encode(hashlib.sha256(str(r + 3).encode()).digest()),
+        "codecs_hash": b64url_encode(hashlib.sha256(str(r + 4).encode()).digest()),
+        "media_devices": "ai1ao1vi4",
+        "pointer_type": p["pointer_type"],
+        "extra": {"vendor": "Google Inc.", "appVersion": ua[len("Mozilla/"):]}
+    }
+
+def make_attestation(challenge, client, viewer_id, device_id):
+    challenge_id = challenge.get("challenge_id")
+    nonce = challenge.get("nonce", "")
+    priv, pub_x, pub_y = ECDSA_P256.generate_keypair()
+    sig_bytes = ECDSA_P256.sign(priv, str(nonce).encode())
+    sig = b64url_encode(sig_bytes)
+    x = b64url_encode(pub_x.to_bytes(32, 'big'))
+    y = b64url_encode(pub_y.to_bytes(32, 'big'))
+    return {
+        "viewer_id": viewer_id,
+        "device_id": device_id,
+        "challenge_id": challenge_id,
+        "nonce": nonce,
+        "signature": sig,
+        "public_key": {"crv": "P-256", "ext": True, "key_ops": ["verify"], "kty": "EC", "x": x, "y": y},
+        "client": client,
+        "storage": {"cookie": viewer_id, "local_storage": viewer_id, "indexed_db": f"{viewer_id}:{device_id}", "cache_storage": f"{viewer_id}:{device_id}"},
+        "attributes": {"entropy": "very_high"}
+    }
+
+# ============================================================
+# PoW (HASH PERSONALIZADO)
+# ============================================================
+
+def _pow_hash(data: bytes):
+    M = 0xFFFFFFFF
+    LR, HR = 2654435761, 2246822519
+    e0, e1, e2, e3 = 1779033703, 3144134277, 1013904242, 2773480762
+    for b in data:
+        e0 = (e0 + b) & M
+        e0 = ((e0 << 7) | (e0 >> 25)) & M
+        e0 = (e0 + e1) & M
+        t = e3 ^ e0
+        e3 = ((t << 16) | (t >> 16)) & M
+        e2 = (e2 + e3) & M
+        t = e1 ^ e2
+        e1 = ((t << 12) | (t >> 20)) & M
+        e0 = (e0 + e1) & M
+        t = e3 ^ e0
+        e3 = ((t << 8) | (t >> 24)) & M
+        e2 = (e2 + e3) & M
+        t = e1 ^ e2
+        e1 = ((t << 7) | (t >> 25)) & M
+    for _ in range(8):
+        e0 = (e0 + e1) & M
+        t = e3 ^ e0
+        e3 = ((t << 16) | (t >> 16)) & M
+        e2 = (e2 + e3) & M
+        t = e1 ^ e2
+        e1 = ((t << 12) | (t >> 20)) & M
+        e0 = (e0 + e1) & M
+        t = e3 ^ e0
+        e3 = ((t << 8) | (t >> 24)) & M
+        e2 = (e2 + e3) & M
+        t = e1 ^ e2
+        e1 = ((t << 7) | (t >> 25)) & M
+    r = [0] * 512
+    for i in range(512):
+        e0 = (e0 + e1) & M
+        t = e3 ^ e0
+        e3 = ((t << 16) | (t >> 16)) & M
+        e2 = (e2 + e3) & M
+        t = e1 ^ e2
+        e1 = ((t << 12) | (t >> 20)) & M
+        e0 = (e0 + e1) & M
+        t = e3 ^ e0
+        e3 = ((t << 8) | (t >> 24)) & M
+        e2 = (e2 + e3) & M
+        t = e1 ^ e2
+        e1 = ((t << 7) | (t >> 25)) & M
+        r[i] = (e0 ^ e2) & M
+    for _ in range(2):
+        for s in range(512):
+            a = r[s] & 511
+            c = (r[s] + r[a]) & M
+            c = ((c << 13) | (c >> 19)) & M
+            c = (c ^ ((r[(s + 1) & 511] * LR) & M)) & M
+            r[s] = c
+            e0 = (e0 ^ c) & M
+            e0 = (e0 + e1) & M
+            t = e3 ^ e0
+            e3 = ((t << 16) | (t >> 16)) & M
+            e2 = (e2 + e3) & M
+            t = e1 ^ e2
+            e1 = ((t << 12) | (t >> 20)) & M
+            e0 = (e0 + e1) & M
+            t = e3 ^ e0
+            e3 = ((t << 8) | (t >> 24)) & M
+            e2 = (e2 + e3) & M
+            t = e1 ^ e2
+            e1 = ((t << 7) | (t >> 25)) & M
+    n = [0] * 8
+    for i in range(8):
+        e0 = (e0 + e1) & M
+        t = e3 ^ e0
+        e3 = ((t << 16) | (t >> 16)) & M
+        e2 = (e2 + e3) & M
+        t = e1 ^ e2
+        e1 = ((t << 12) | (t >> 20)) & M
+        e0 = (e0 + e1) & M
+        t = e3 ^ e0
+        e3 = ((t << 8) | (t >> 24)) & M
+        e2 = (e2 + e3) & M
+        t = e1 ^ e2
+        e1 = ((t << 7) | (t >> 25)) & M
+        sv = e0
+        base = i * 64
+        for c in range(64):
+            d = r[base + c]
+            sv = (sv + d) & M
+            sv = ((sv << 5) | (sv >> 27)) & M
+            sv = (sv ^ ((d * HR) & M)) & M
+        n[i] = (sv ^ e2) & M
+    return n
+
+def _lzbits(t):
+    bits = 0
+    for x in t:
+        if x == 0:
+            bits += 32
+            continue
+        return bits + (32 - x.bit_length())
+    return bits
+
+def solve_pow(nonce: str, difficulty: int, timeout_ms=90000):
+    if difficulty <= 0:
+        return "0"
+    prefix = nonce + ":"
+    start = time.time()
+    s = random.randint(0, 1000000)
+    while True:
+        for _ in range(32768):
+            if _lzbits(_pow_hash((prefix + str(s)).encode())) >= difficulty:
+                return str(s)
+            s += 1
+        if (time.time() - start) * 1000 > timeout_ms:
+            return None
+
+
+# ============================================================
+# Decode playback
+# ============================================================
+
+def decode_playback(playback_obj: dict):
+    key_parts = playback_obj.get("key_parts", [])
+    version_raw = playback_obj.get("version", 0)
+    version = int(version_raw) if str(version_raw).isdigit() else 0
+
+    if version and len(key_parts) >= version:
+        idx1 = version - 1
+        idx2 = len(key_parts) - version
+        if idx1 < len(key_parts) and idx2 < len(key_parts):
+            selected = [key_parts[idx1], key_parts[idx2]]
+        else:
+            selected = key_parts[:2]
+    else:
+        selected = key_parts[:2]
+
+    key_bytes = b"".join(b64url_decode(p) for p in selected)
+    if len(key_bytes) > 32:
+        key_bytes = key_bytes[:32]
+
+    iv = b64url_decode(playback_obj.get("iv", ""))
+    if len(iv) > 12:
+        iv = iv[:12]
+    elif len(iv) < 12:
+        iv = iv + b"\x00" * (12 - len(iv))
+
+    payload = b64url_decode(playback_obj.get("payload", ""))
+    if len(payload) < 16:
+        return None
+    ciphertext, tag = payload[:-16], payload[-16:]
+    try:
+        plaintext = aes_gcm_decrypt(key_bytes, iv, ciphertext, tag, b"")
+        return json.loads(plaintext.decode("utf-8"))
+    except Exception:
+        return None
+
+
+# ============================================================
+# Resolve byse
+# ============================================================
+
+def resolve_byse(embed_url: str, parent_origin: str = "api.pomfy.stream", parent_page: str = None) -> Optional[str]:
+    parsed = urllib.parse.urlparse(embed_url)
+    api_base = f"{parsed.scheme}://{parsed.netloc}"
+    video_id = parsed.path.strip("/").split("/")[-1]
+    if not parent_page:
+        parent_page = embed_url
+
+    client = generate_fingerprint()
+    base_headers = {
+        "User-Agent": client["user_agent"],
+        "Accept": "application/json, text/plain, */*",
+        "Origin": api_base,
+        "Referer": embed_url,
+        "X-Embed-Origin": parent_origin,
+        "X-Embed-Referer": embed_url,
+        "X-Embed-Parent": parent_page,
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+    }
+
+    st, body = _request(f"{api_base}/api/videos/access/challenge", "POST", {}, base_headers)
+    if st != 200:
+        return None
+    try:
+        chal = json.loads(body)
+    except Exception:
+        return None
+
+    viewer_id = chal.get("viewer_hint") or b64url_encode(random_bytes(16))
+    device_id = b64url_encode(random_bytes(16))
+    attest_payload = make_attestation(chal, client, viewer_id, device_id)
+    st, body = _request(f"{api_base}/api/videos/access/attest", "POST", attest_payload, base_headers)
+    if st != 200:
+        return None
+    try:
+        att = json.loads(body)
+    except Exception:
+        return None
+
+    viewer_id = att.get("viewer_id") or viewer_id
+    device_id = att.get("device_id") or device_id
+    fingerprint = {
+        "token": att.get("token"),
+        "viewer_id": viewer_id,
+        "device_id": device_id,
+        "confidence": att.get("confidence") or 0.93,
+    }
+
+    cookie_headers = dict(base_headers)
+    cookie_headers["Cookie"] = f"byse_viewer_id={viewer_id}; byse_device_id={device_id}"
+
+    st, body = _request(
+        f"{api_base}/api/videos/{video_id}/embed/captcha",
+        "POST",
+        {"fingerprint": fingerprint},
+        cookie_headers,
+    )
+    if st != 200:
+        return None
+    try:
+        cap = json.loads(body)
+    except Exception:
+        return None
+
+    solution = solve_pow(cap.get("pow_nonce"), cap.get("pow_difficulty", 0))
+    if solution is None:
+        return None
+
+    st, body = _request(
+        f"{api_base}/api/videos/{video_id}/embed/captcha/verify",
+        "POST",
+        {
+            "pow_token": cap.get("pow_token"),
+            "solution": solution,
+            "fingerprint": fingerprint,
+        },
+        cookie_headers,
+    )
+    if st != 200:
+        return None
+    try:
+        ver = json.loads(body)
+    except Exception:
+        return None
+    captcha_token = ver.get("token")
+
+    pb_headers = dict(cookie_headers)
+    if captcha_token:
+        pb_headers["X-Captcha-Token"] = captcha_token
+    st, body = _request(
+        f"{api_base}/api/videos/{video_id}/embed/playback",
+        "POST",
+        {"fingerprint": fingerprint},
+        pb_headers,
+    )
+    if st != 200:
+        return None
+    try:
+        pb = json.loads(body)
+    except Exception:
+        return None
+
+    sources = pb.get("sources")
+    if sources and len(sources) > 0:
+        return sources[0].get("url")
+
+    playback_obj = pb.get("playback")
+    if not playback_obj:
+        return None
+    decrypted = decode_playback(playback_obj)
+    if not decrypted:
+        return None
+    src = decrypted.get("sources") or (decrypted.get("data") or {}).get("sources")
+    if src and len(src) > 0:
+        return src[0].get("url")
+    return decrypted.get("url")
+
+
+# ============================================================
+# Pomfy API (iframe) -> byseUrl
+# ============================================================
+
+def pomfy_get_byse_url(tmdb_id, media_type="movie", season=None, episode=None) -> Optional[str]:
+    if media_type == "movie":
+        path = f"filme/{tmdb_id}"
+        parent = f"https://pomfy.online/assistir/{tmdb_id}"
+        page_url = f"https://api.pomfy.stream/filme/{tmdb_id}"
+    else:
+        season = int(season) if season else 1
+        episode = int(episode) if episode else 1
+        path = f"serie/{tmdb_id}/{season}/{episode}"
+        parent = f"https://pomfy.online/assistir/{tmdb_id}"
+        page_url = f"https://api.pomfy.stream/serie/{tmdb_id}/{season}/{episode}"
+
+    # CRÍTICO: Sec-Fetch-Dest iframe (senão Cloudflare 403)
+    iframe_headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": parent,
+        "Sec-Fetch-Dest": "iframe",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "cross-site",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    st, body = _request(page_url, headers=iframe_headers)
+    if st != 200:
+        return None
+
+    m = re.search(r'const statusToken="([^"]+)"', body)
+    if not m:
+        m = re.search(r'statusToken["\']?\s*[:=]\s*["\']([^"\']+)', body)
+    if not m:
+        return None
+    token = m.group(1)
+
+    st, body = _request(
+        f"https://api.pomfy.stream/api/play-token?t={token}",
+        headers={
+            "accept": "*/*",
+            "referer": page_url,
+            "Origin": "https://api.pomfy.stream",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        },
+    )
+    if st != 200:
+        return None
+    try:
+        data = json.loads(body)
+    except Exception:
+        return None
+    return data.get("byseUrl") or data.get("url")
+
+
+# ============================================================
+# TMDB
 # ============================================================
 
 def imdb_to_tmdb(imdb_id: str, media_type: str = "movie") -> Optional[int]:
-    """Converte ID IMDB para TMDB"""
     url = (
         f"https://api.themoviedb.org/3/find/{imdb_id}"
         f"?api_key={TMDB_API_KEY}&external_source=imdb_id"
     )
-
-    status, body = _request(url, headers={"Accept": "application/json"})
-
-    if status != 200:
+    st, body = _request(url, headers={"Accept": "application/json"})
+    if st != 200:
         return None
-
     try:
         data = json.loads(body)
-    except (ValueError, TypeError):
+    except Exception:
         return None
-
-    if media_type == "movie":
-        results = data.get("movie_results", [])
-    else:
-        results = data.get("tv_results", [])
-
-    if results and len(results) > 0:
+    key = "movie_results" if media_type == "movie" else "tv_results"
+    results = data.get(key) or []
+    if results:
         return results[0].get("id")
-
     return None
 
 
 # ============================================================
-# FUNÇÃO PRINCIPAL: get_streams
+# get_streams
 # ============================================================
 
 def get_streams(media_type: str, media_id: str, config: dict = None) -> list:
-    """
-    Obtém os streams para um filme ou série
-
-    Args:
-        media_type: "movie" ou "series"
-        media_id: "tt0111161" ou "tt0944947:1:1"
-        config: Configuração opcional
-
-    Returns:
-        Lista de streams com informações do vídeo
-    """
-    # Parseia media_id
     imdb_id = media_id
     season = None
     episode = None
-
     if ":" in media_id:
         parts = media_id.split(":", 2)
         imdb_id = parts[0]
@@ -547,178 +960,43 @@ def get_streams(media_type: str, media_id: str, config: dict = None) -> list:
             episode = parts[2]
 
     try:
-        # ============================================================
-        # PASSO 1: Converte IMDB para TMDB se necessário
-        # ============================================================
-
-        tmdb_id = None
-        if imdb_id.lower().startswith("tt"):
+        if str(imdb_id).lower().startswith("tt"):
             tmdb_id = imdb_to_tmdb(imdb_id, media_type)
             if not tmdb_id:
                 return []
         else:
             tmdb_id = imdb_id
 
-        # ============================================================
-        # PASSO 2: Obtém a página do filme/série
-        # ============================================================
-
-        if media_type == "movie":
-            page_url = f"https://api.pomfy.stream/filme/{tmdb_id}"
-        else:
-            season = int(season) if season else 1
-            episode = int(episode) if episode else 1
-            page_url = f"https://api.pomfy.stream/serie/{tmdb_id}/{season}/{episode}"
-
-        status, page_html = _request(page_url, headers=DEFAULT_HEADERS)
-
-        if status != 200:
-            return []
-
-        # ============================================================
-        # PASSO 3: Extrai o statusToken do HTML
-        # ============================================================
-
-        status_token = None
-
-        token_patterns = [
-            r'const statusToken="([^"]+)"',
-            r'statusToken["\']?\s*[:=]\s*["\']([^"\']+)["\']',
-            r'["\']statusToken["\']\s*:\s*["\']([^"\']+)["\']'
-        ]
-
-        for pattern in token_patterns:
-            match = re.search(pattern, page_html)
-            if match and match.group(1):
-                status_token = match.group(1)
-                break
-
-        if not status_token:
-            return []
-
-        # ============================================================
-        # PASSO 4: Obtém o byseUrl
-        # ============================================================
-
-        token_url = f"https://api.pomfy.stream/api/play-token?t={status_token}"
-
-        token_headers = {
-            "accept": "*/*",
-            "cookie": "SITE_TOTAL_ID=aTYqe6GU65PNmeCXpelwJwAAAMi; __dtsu=104017651574995957BEB724C6373F9E; __cc_id=a44d1e52993b9c2Oaaf40eba24989a06",
-            "referer": page_url,
-            "user-agent": USER_AGENT
-        }
-
-        status, token_body = _request(token_url, headers=token_headers)
-
-        if status != 200:
-            return []
-
-        try:
-            token_data = json.loads(token_body)
-        except (ValueError, TypeError):
-            return []
-
-        byse_url = token_data.get("byseUrl")
-
+        byse_url = pomfy_get_byse_url(tmdb_id, media_type, season, episode)
         if not byse_url:
             return []
 
-        # ============================================================
-        # PASSO 5: Obtém o embed_frame_url
-        # ============================================================
+        if media_type == "movie":
+            parent_page = f"https://api.pomfy.stream/filme/{tmdb_id}"
+        else:
+            s = int(season) if season else 1
+            e = int(episode) if episode else 1
+            parent_page = f"https://api.pomfy.stream/serie/{tmdb_id}/{s}/{e}"
 
-        video_id = byse_url.split("/")[-1]
-        details_url = f"https://pomfy-cdn.shop/api/videos/{video_id}/embed/details"
-
-        details_headers = {
-            "referer": byse_url,
-            "x-embed-origin": "api.pomfy.stream",
-            "user-agent": USER_AGENT
-        }
-
-        status, details_body = _request(details_url, headers=details_headers)
-
-        if status != 200:
-            return []
-
-        try:
-            details_data = json.loads(details_body)
-        except (ValueError, TypeError):
-            return []
-
-        embed_frame_url = details_data.get("embed_frame_url")
-
-        if not embed_frame_url:
-            return []
-
-        # ============================================================
-        # PASSO 6: Gera fingerprint e faz POST para obter o playback
-        # ============================================================
-
-        # Extrai o origin da URL
-        parsed_url = urllib.parse.urlparse(embed_frame_url)
-        origin_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-
-        fingerprint = generate_fingerprint()
-
-        playback_url = f"{origin_url}/api/videos/{video_id}/embed/playback"
-
-        playback_headers = {
-            "content-type": "application/json",
-            "origin": origin_url,
-            "referer": embed_frame_url,
-            "user-agent": USER_AGENT,
-            "x-embed-origin": "api.pomfy.stream",
-            "x-embed-parent": byse_url
-        }
-
-        playback_payload = {"fingerprint": fingerprint}
-
-        status, playback_body = _request(
-            playback_url,
-            method="POST",
-            data=playback_payload,
-            headers=playback_headers
+        stream_url = resolve_byse(
+            byse_url,
+            parent_origin="api.pomfy.stream",
+            parent_page=parent_page,
         )
-
-        if status != 200:
+        if not stream_url:
             return []
 
-        try:
-            playback_data = json.loads(playback_body)
-        except (ValueError, TypeError):
-            return []
-
-        if not playback_data.get("playback"):
-            return []
-
-        # ============================================================
-        # PASSO 7: Decodifica o playback e extrai a URL
-        # ============================================================
-
-        decoded = decode_playback(playback_data["playback"])
-
-        if not decoded.get("success"):
-            return []
-
-        # ============================================================
-        # RETORNA O STREAM
-        # ============================================================
-
+        stream_url = stream_url.replace("\\u0026", "&")
         return [
             {
                 "name": TITLE,
                 "title": "1080P",
-                "url": decoded["url"],
+                "url": stream_url,
                 "behaviorHints": {
-                    "notMyMetadata": True,
-                    "proxyHeaders": {
-                        "request": STREAM_HEADERS
-                    }
+                    "notWebReady": True,
+                    "proxyHeaders": {"request": STREAM_HEADERS},
                 },
             }
         ]
-
     except Exception:
         return []
