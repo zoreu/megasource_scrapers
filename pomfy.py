@@ -39,7 +39,7 @@ TMDB_API_KEY = (
     "\x30\x36\x37\x62\x38\x37\x37\x32\x64\x65\x35\x37\x36\x64\x36\x62"
 )
 
-STREAM_HEADERS = {"User-Agent": USER_AGENT,"Referer": "https://pomfy.online/"}
+STREAM_HEADERS = {"User-Agent": USER_AGENT, "Referer": "https://pomfy.online/"}
 
 _cookiejar = http.cookiejar.CookieJar()
 _opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_cookiejar))
