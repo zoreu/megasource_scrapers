@@ -31,7 +31,7 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 
-TITLE = "StreamBR"
+TITLE = "StreamBR Scraper"
 VERSION = "1.0.0"
 DESCRIPTION = "Filmes e Series do StreamBR"
 
